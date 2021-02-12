@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+
+  payeraccountid:
+    Description: >-
+      AWS Account ID of the payer account
+    Type: String
+    Default: "341476298946"
+  payeraccountregion:
+    Description: >-
+      AWS Region in the payer account where the MAP CUR report is delivered
+    Type: String
+    Default: "us-east-1"
+  s3outputbucketname:
+    Description: >-
+      S3 Output Bucket Name that contains the extracted parquet files for the linked account. 
+    Type: String
+    Default: "s3-map-linkedaccount"
+  outputfolder:
+    Description: >-
+      Sub folder in S3 Output Bucket 
+    Type: String
+    Default: "map-migrate-linkedaccount"
+  linkedaccountdb:
+    Description: >-
+      Athena DB Name for the MAP Reports delivered in the linked account
+    Type: String
+    Default: "athena_map_migrated_report_1"
+
+Resources:
+
+  LinkedAccountDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      DatabaseInput:
+        Name: !Ref linkedaccountdb
+      CatalogId: !Ref AWS::AccountId
+         
+
+  LinkedAccountCrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole'
+      Policies:
+        - PolicyName: LinkedAccountCrawlerRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'glue:UpdateDatabase'
+                  - 'glue:UpdatePartition'
+                  - 'glue:CreateTable'
+                  - 'glue:UpdateTable'
+                  - 'glue:ImportCatalogToGlue'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${payeraccountid}-${payeraccountregion}
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${payeraccountid}-${payeraccountregion}/*
+
+       
+  LinkedAccountCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Name: LinkedAccountCrawler
+      Description: A scheduled crawler that keeps your Linked Account CUR table in  Athena up-to-date.
+      Role: !GetAtt LinkedAccountCrawlerRole.Arn
+      DatabaseName: !Ref LinkedAccountDatabase
+      Schedule:
+        ScheduleExpression: "cron(0/2 * ? * SUN-SAT *)"
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${s3outputbucketname}-${payeraccountid}-${payeraccountregion}/${outputfolder}/'
+            Exclusions:
+              - '**.json'
+              - '**.yml'
+              - '**.sql'
+              - '**.csv'
+              - '**.gz'
+              - '**.zip'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DELETE_FROM_DATABASE
+       
+
+ 

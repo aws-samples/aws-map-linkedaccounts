@@ -1,0 +1,611 @@
+
+Description: Amazon CloudWatch Events for AWS Glue Crawler, AWS Lambda for automating Athena Queries
+AWSTemplateFormatVersion: "2010-09-09"
+
+# Provides MAP Spend Visibility for Linked Accounts
+#### STEP 1:
+##  1. Provisions Output S3 Bucket that contains Parquet files for MAP Linked Accounts
+#   2. Provisions AWS Lambda for cross account permission on Output S3 Bucket objects
+#   3. Provisions S3 Event Notification on Output S3 Bucket that triggers the 
+##     AWS Lambda above for Cross Account permissions 
+#### STEP 2: 
+#   4. Provisions AWS Lambda to execute Athena MAP Extraction Query for Linked Accounts
+#   5. Provisions CWE for Glue Crawler event notification that triggers the 
+##     AWS Lambda above for Athena MAP Extraction Query
+#
+#
+# @kmmahaj
+#
+## License:
+## This code is made available under the MIT-0 license. See the LICENSE file.
+
+
+Parameters:
+  sourcebucket:
+    Description: S3 Bucket that contains AWS Lambda source. REPLACE ACCOUNT ID AND REGION
+    Type: String
+    Default: 's3-maplinkedaccountlambdas-<AWS::AccountId>-<AWS::Region>'
+    MinLength: '1'
+    MaxLength: '255'
+  s3outputbucketname:
+    Description: >-
+      S3 Output Bucket Name that contains the extracted parquet files for the linked account. 
+    Type: String
+    Default: "s3-map-linkedaccount"
+  outputfolder:
+    Description: >-
+      Sub folder in S3 Output Bucket 
+    Type: String
+    Default: "map-migrate-linkedaccount"
+  mapmigrateddb:
+    Description: >-
+      Athena DB Name for the MAP Reports delivered in the payer account
+    Type: String
+    Default: "athenacurcfn_map_migrated_report_1"
+  mapmigratedtable:
+    Description: >-
+       Athena Table Name for the MAP Reports delivered in the payer account
+    Type: String
+    Default: "map_migrated_report_1"
+  extractionqueryname:
+    Description: >-
+       Name of the saved Athena extraction query
+    Type: String
+    Default: "maplinkedquery"
+  athenaoutputlocation:
+    Description: >-
+      Athena results location from Athena settings
+    Type: String
+    Default: "s3://aws-athena-queryresults-us-east-1/results/"
+  payergluecrawlername:
+    Description: >-
+      Name of the Glue Crawler that creates MAP reports in payer account
+    Type: String
+    Default: "AWSCURCrawler-map-migrated-report-1"
+  linkedaccountid:
+    Description: >-
+      AWS Account ID of the linked account
+    Type: String
+    Default: "875914227481"
+  canonicalidpayer:
+    Description: >-
+      Canonical ID of the payer account
+    Type: String
+    Default: "ec3615d883890ff9f356436fdfff1d01ed7a7ecac09dbf300e7069263a7e6304"
+  canonicalidlinked:
+    Description: >-
+      Canonical ID of the linked account
+    Type: String
+    Default: "f250446b450b9c8aab8677d65b4b9c655b2c50ef5ff1c98552df4d90eba2a1c8"
+
+
+Resources:
+
+#MAP Athena Extraction Query Lambda
+  MAPAthenaExtractionQueryLambda:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - CreateS3OutputBucketNotification
+    Properties:
+      FunctionName: !Join 
+        - ''
+        - - MAP_
+          - athenaextractionquerylambda
+      Role: !GetAtt MAPAthenaExtractionQueryLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref sourcebucket
+        S3Key: !Join 
+          - ''
+          - - MAP_athenaextractionquerylambda
+            - /
+            - MAP_athenaextractionquerylambda
+            - .zip
+      Description: MAP Athena Extraction Query Lambda
+      Handler: MAP_athenaextractionquerylambda.lambda_handler
+      Environment:
+        Variables:
+          s3outputbucketname: !Sub "${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}"
+          outputfolder: !Ref outputfolder
+          map_migrated_db: !Ref mapmigrateddb
+          map_migrated_table: !Ref mapmigratedtable
+          extraction_query_name: !Ref extractionqueryname
+          athena_output_location: !Ref athenaoutputlocation
+      MemorySize: '256'
+      Runtime: python3.7
+      Timeout: 300
+
+#MAP Athena Extraction Query Lambda Role
+  MAPAthenaExtractionQueryLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub map-athenaextractionquerylambdarole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AthenaS3Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: '1'
+                Action:
+                  - 's3:*'
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: '2'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Effect: Allow
+                Resource: '*'
+              - Sid: '3'
+                Action:
+                  - 'secretsmanager:*'
+                Effect: Allow
+                Resource: '*'
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------
+# Payer Glue Crawler CWE Rule that triggers the MAPAthenaExtractionQuery Lambda
+# -------------------------------------------------------------------------------------------------------------------------------------------------------
+
+  PayerGlueCrawlerRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: PayerGlueCrawlerRule
+      Description: "Payer Glue Crawler CWE Rule that triggers the MAPAthenaExtractionQuery Lambda"
+      EventPattern: 
+        source: 
+          - aws.glue
+        detail-type: 
+          - Glue Crawler State Change
+        detail: 
+          crawlerName:
+          - !Ref payergluecrawlername
+          state:
+          - Succeeded
+      State: ENABLED
+      Targets:
+      - Arn: !GetAtt "MAPAthenaExtractionQueryLambda.Arn"
+        Id: IDMAPAthenaExtractionQuery
+
+
+  PayerGlueCrawlerRuleLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "MAPAthenaExtractionQueryLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "PayerGlueCrawlerRule"
+          - "Arn"
+
+  PayerScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: PayerScheduledRule
+      Description: "Payer Scheduled CWE Rule that triggers the MAPAthenaExtractionQuery Lambda"
+      State: "ENABLED"
+      ScheduleExpression: "rate(5 minutes)"
+      Targets:
+      - Arn: !GetAtt "MAPAthenaExtractionQueryLambda.Arn"
+        Id: IDMAPAthenaExtractionQuery
+
+
+  PayerScheduledRuleLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "MAPAthenaExtractionQueryLambda"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "PayerScheduledRule"
+          - "Arn"
+
+
+#--------------------------------------------------------------------------------------------
+# S3 Output Bucket for Linked Accounts. 
+# S3 Bucket Event Trigger for Cross Account Permissions Lambda
+# --------------------------------------------------------------------------------------------
+
+# S3 Output Bucket for LinkedAccount
+  S3OutputBucketForLinkedAccount:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      AccessControl: BucketOwnerFullControl
+      LifecycleConfiguration:
+        Rules:
+          -
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+            NoncurrentVersionExpirationInDays: 3
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        -
+          Key: Description
+          Value: S3 Output Bucket for LinkedAccount
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Bucket Policy for S3 Bucket for Linked Account
+  S3OutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3OutputBucketForLinkedAccount
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - "s3:*"
+            Effect: "Allow"
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}/*'
+              - !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}/{outputfolder}/*'
+            Principal:
+              AWS:
+              - !Sub 'arn:${AWS::Partition}:iam::${linkedaccountid}:root'
+
+
+  S3OutputBucketNotificationLambda:
+    Type: 'AWS::Lambda::Function'
+    DependsOn:
+      - S3OutputBucketPermissionsLambda
+    Properties:
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const response = require('./cfn-response');
+          exports.handler = function(event, context, callback) {
+            const s3 = new AWS.S3();
+            const putConfigRequest = function(notificationConfiguration) {
+              return new Promise(function(resolve, reject) {
+                s3.putBucketNotificationConfiguration({
+                  Bucket: event.ResourceProperties.BucketName,
+                  NotificationConfiguration: notificationConfiguration
+                }, function(err, data) {
+                  if (err) reject({ msg: this.httpResponse.body.toString(), error: err, data: data });
+                  else resolve(data);
+                });
+              });
+            };
+            const newNotificationConfig = {};
+            if (event.RequestType !== 'Delete') {
+              newNotificationConfig.LambdaFunctionConfigurations = [{
+                Events: [ 's3:ObjectCreated:*' ],
+                LambdaFunctionArn: event.ResourceProperties.TargetLambdaArn
+              }];
+            }
+            putConfigRequest(newNotificationConfig).then(function(result) {
+              response.send(event, context, response.SUCCESS, result);
+              callback(null, result);
+            }).catch(function(error) {
+              response.send(event, context, response.FAILED, error);
+              console.log(error);
+              callback(error);
+            });
+          };
+      Handler: 'index.handler'
+      Timeout: 30
+      Runtime: nodejs12.x
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt S3OutputBucketNotificationLambdaRole.Arn
+     
+  CreateS3OutputBucketNotification:
+    Type: 'Custom::CreateS3OutputBucketNotification'
+    DependsOn:
+      - CreateS3OutputBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt S3OutputBucketNotificationLambda.Arn
+      TargetLambdaArn: !GetAtt S3OutputBucketPermissionsLambda.Arn
+      BucketName: !Sub "${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}"
+      FolderName: !Sub "${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}/${outputfolder}"
+
+  S3EventNotificationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt S3OutputBucketPermissionsLambda.Arn
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}'
+     
+  CreateS3OutputBucketPolicy:
+    Type: 'Custom::CreateS3OutputBucketPolicy'
+    Properties:
+      ServiceToken: !GetAtt S3OutputBucketPolicyLambda.Arn
+      BucketName: !Sub "${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}"
+      FolderName: !Ref outputfolder
+
+  S3OutputBucketPolicyLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Runtime: python3.7
+      MemorySize: 256
+      Role: !GetAtt 'S3OutputBucketNotificationLambdaRole.Arn'
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import botocore
+          import os
+          import cfnresponse
+          import logging
+          from botocore.vendored import requests
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+              
+          def handler(event, context):
+              foldername = event['ResourceProperties']['FolderName'] + + '/'
+              bucketname = event['ResourceProperties']['BucketName']
+              logger.info('EVENT Received: {}'.format(event))
+              eventType = event['RequestType']
+              if eventType != 'Delete':
+                  logger.info('Event = ' + event['RequestType'])
+                  s3 = boto3.client('s3')
+                  response_folder = s3.put_object(
+                                Bucket=bucketname, 
+                                Key=outputfolder
+                  )
+                  response_acl = s3.put_bucket_acl(
+                     AccessControlPolicy={
+                          'Owner':
+                          {
+                              'DisplayName': process.env.payeraccountid.toString(),
+                              'ID': process.env.canonicalidpayer.toString()
+                          },
+                          'Grants': 
+                          [
+                              {
+                                  'Grantee': 
+                                  {
+                                      'Type': 'CanonicalUser',
+                                      'DisplayName': process.env.payeraccountid.toString(),
+                                      'ID': process.env.canonicalidpayer.toString()
+                                  },
+                                  'Permission': 'FULL_CONTROL'
+                              },
+                              {
+                                  'Grantee': {
+                                      'Type': 'CanonicalUser',
+                                      'DisplayName': process.env.linkedaccountid.toString(),
+                                      'ID': process.env.canonicalidlinked.toString()
+                                      },
+                                  'Permission': 'READ'
+                              },
+                          ]
+                      },
+                      Bucket=bucketname,
+                  )
+  
+                  cfnsend(event, context, 'SUCCESS', response_data)
+                  return "Success"
+
+              else:
+                  logger.info(f'Request Type is Delete; unsupported')
+                  cfnsend(event, context, 'SUCCESS', response_data)
+                  return event
+
+              cfnsend(event, context, 'SUCCESS', response_data)
+              return "Success"
+
+     
+          def cfnsend(event, context, responseStatus, responseData, reason=None):
+              if 'ResponseURL' in event:
+                  responseUrl = event['ResponseURL']
+                  # Build out the response json
+                  responseBody = {}
+                  responseBody['Status'] = responseStatus
+                  responseBody['Reason'] = reason or 'CWL Log Stream =' + context.log_stream_name
+                  responseBody['PhysicalResourceId'] = context.log_stream_name
+                  responseBody['StackId'] = event['StackId']
+                  responseBody['RequestId'] = event['RequestId']
+                  responseBody['LogicalResourceId'] = event['LogicalResourceId']
+                  responseBody['Data'] = responseData
+                  json_responseBody = json.dumps(responseBody)
+
+                  logger.info(f'Response body: + {json_responseBody}')
+
+                  headers = {
+                      'content-type': '',
+                      'content-length': str(len(json_responseBody))
+                  }
+                  # Send response back to CFN
+                  try:
+                      response = requests.put(responseUrl,
+                                              data=json_responseBody,
+                                              headers=headers)
+                      logger.info(f'Status code: {response.reason}')
+                  except Exception as e:
+                      logger.info(f'send(..) failed executing requests.put(..):  {str(e)}')
+  
+
+  S3OutputBucketPolicyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt S3OutputBucketPolicyLambda.Arn
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}'
+
+
+  S3OutputBucketNotificationLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: S3OutputBucketNotificationLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}'
+
+
+#MAP S3 Output Bucket Permissions Lambda
+  S3OutputBucketPermissionsLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Join 
+        - ''
+        - - MAP_
+          - s3outputbucketpermissionslambda
+      Role: !GetAtt S3OutputBucketPermissionsLambdaRole.Arn
+      Code:
+        ZipFile: >
+          const AWS = require('aws-sdk');
+          const util = require('util');
+          exports.handler = function(event, context, callback) {
+              
+              // If its an object delete, do nothing
+              if (event.RequestType === 'Delete') {
+              }
+              else // Its an object put
+              {
+                  // Get the source bucket from the S3 event
+                  var srcBucket = event.Records[0].s3.bucket.name;      
+                  // Object key may have spaces or unicode non-ASCII characters, decode it
+                  var srcKey = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, " "));  
+                  // Define the object permissions, using the permissions array
+                  var params =
+                  {
+                      Bucket: srcBucket,
+                      Key: srcKey,
+                      AccessControlPolicy:
+                      {
+                          'Owner':
+                          {
+                              'DisplayName': process.env.payeraccountid.toString(),
+                              'ID': process.env.canonicalidpayer.toString()
+                          },
+                          'Grants': 
+                          [
+                              {
+                                  'Grantee': 
+                                  {
+                                      'Type': 'CanonicalUser',
+                                      'DisplayName': process.env.payeraccountid.toString(),
+                                      'ID': process.env.canonicalidpayer.toString()
+                                  },
+                                  'Permission': 'FULL_CONTROL'
+                              },
+                              {
+                                  'Grantee': {
+                                      'Type': 'CanonicalUser',
+                                      'DisplayName': process.env.linkedaccountid.toString(),
+                                      'ID': process.env.canonicalidlinked.toString()
+                                      },
+                                  'Permission': 'READ'
+                              },
+                          ]
+                      }
+                  };
+
+                  // get reference to S3 client 
+                  var s3 = new AWS.S3();
+                  // Put the ACL on the object
+                  s3.putObjectAcl(params, function(err, data) {
+                      if (err) console.log(err, err.stack); // an error occurred
+                      else     console.log(data);           // successful response
+                  });
+              }
+           };
+      Handler: 'index.handler'
+      Environment:
+        Variables:
+          payeraccountid: !Ref AWS::AccountId
+          linkedaccountid: !Ref linkedaccountid
+          canonicalidpayer: !Ref canonicalidpayer
+          canonicalidlinked: !Ref canonicalidlinked
+          outputfolder: !Ref outputfolder
+      MemorySize: '256'
+      Runtime: nodejs12.x
+      ReservedConcurrentExecutions: 1
+      Timeout: 300
+
+
+#MAP S3 Output Bucket Permissions Lambda Role
+  S3OutputBucketPermissionsLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub map-s3outputbucketpermissionslambdarole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowLambdaAssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: '1'
+                Action:
+                  - 's3:*'
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:${AWS::Partition}:s3:::${s3outputbucketname}-${AWS::AccountId}-${AWS::Region}/*
+              - Sid: '2'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Effect: Allow
+                Resource: '*'
+              - Sid: '3'
+                Action:
+                  - 'secretsmanager:*'
+                Effect: Allow
+                Resource: '*'
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AdministratorAccess"
