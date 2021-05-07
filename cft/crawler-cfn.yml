@@ -144,7 +144,7 @@ Resources:
           };
       Handler: 'index.handler'
       Timeout: 30
-      Runtime: nodejs10.x
+      Runtime: nodejs14.x
       ReservedConcurrentExecutions: 1
       Role: !GetAtt AWSCURCrawlerLambdaExecutor.Arn
      
@@ -238,7 +238,7 @@ Resources:
           };
       Handler: 'index.handler'
       Timeout: 30
-      Runtime: nodejs10.x
+      Runtime: nodejs14.x
       ReservedConcurrentExecutions: 1
       Role: !GetAtt AWSS3CURLambdaExecutor.Arn
      
